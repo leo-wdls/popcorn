@@ -13,7 +13,7 @@ vpath %.texi $(SRC_PATH)
 vpath %/fate_config.sh.template $(SRC_PATH)
 
 AVPROGS-$(CONFIG_FFMPEG)   += ffmpeg
-AVPROGS-$(CONFIG_FFPLAY)   += ffplay
+AVPROGS-$(CONFIG_FFPLAY)   += popcorn
 AVPROGS-$(CONFIG_FFPROBE)  += ffprobe
 AVPROGS-$(CONFIG_FFSERVER) += ffserver
 
@@ -21,7 +21,7 @@ AVPROGS    := $(AVPROGS-yes:%=%$(PROGSSUF)$(EXESUF))
 INSTPROGS   = $(AVPROGS-yes:%=%$(PROGSSUF)$(EXESUF))
 PROGS      += $(AVPROGS)
 
-AVBASENAMES  = ffmpeg ffplay ffprobe ffserver
+AVBASENAMES  = ffmpeg popcorn ffprobe ffserver
 ALLAVPROGS   = $(AVBASENAMES:%=%$(PROGSSUF)$(EXESUF))
 ALLAVPROGS_G = $(AVBASENAMES:%=%$(PROGSSUF)_g$(EXESUF))
 
