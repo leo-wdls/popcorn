@@ -5,6 +5,8 @@
 #include "libavformat/avformat.h"
 #include "libswscale/swscale.h"
 #include "libavutil/log.h"
+#include "libavutil/intmath.h"
+#include "libswresample/swresample.h"
 #include "list.h"
 
 
@@ -16,17 +18,20 @@
 #define SDL_VERSION_LIBSDL1P2_DEV
 //#define SDL_VERSION_LIBSDL2P0_DEV
 
+//#define __DEBUG_QUEUE__
+
 
 #define _4K_    (4*1024)
 
-#if 0
+#if 1
 #define BMP_PATH  "/data/test_xiaoxin"
 #else
 #define BMP_PATH  "/home/leo/test"
 #endif
 
-#define MAX_VIDEO_PACKET_QUEUE_LEN         (5)
+#define MAX_VIDEO_PACKET_QUEUE_LEN          (5)
 #define MAX_VIDEO_FRAME_QUEUE_LEN            (5)
+#define MAX_AUDIO_PACKET_QUEUE_LEN          (5)
 #define MAX_QUEUE_SIZE                                  (15*1024*1024)
 
 static void av_write_log(const char *fmt, ...);
@@ -41,6 +46,11 @@ static void av_write_log(const char *fmt, ...);
 
 #define av_err_log(fmt, args...)  printf(TAG fmt, ##args)
 //#define av_err_log(fmt, args...)  av_write_log(TAG fmt, ##args)
+
+/* Minimum SDL audio buffer size, in samples. */
+#define SDL_AUDIO_MIN_BUFFER_SIZE 512
+/* Calculate actual buffer size keeping in mind not cause too frequent audio callbacks */
+#define SDL_AUDIO_MAX_CALLBACKS_PER_SEC 30
 
 enum BMP_FORMAT {
    BMP_FMT_RGB24,
@@ -62,10 +72,10 @@ typedef struct InputParams {
 }InputParams;
 
 typedef enum SteamIndex {
-     VIDEO_STREAM_INDEX = 0,
-     AUDIO_STREAM_INDEX,
-     SUBTILE_STREAM_INDEX,
-     MAX_STREAM_INDEX,
+    VIDEO_STREAM_INDEX = 0,
+    AUDIO_STREAM_INDEX,
+    SUBTILE_STREAM_INDEX,
+    MAX_STREAM_INDEX,
 } streamIndex;
 
 typedef enum ShowMode {
@@ -74,6 +84,12 @@ typedef enum ShowMode {
     SHOW_MODE_AUDIO = 0X02,
     SHOW_MODE_NB = 0X01 |0X02,
 }ShowMode;
+
+typedef enum SyncMode {
+    SYNC_VIDEO_MASTER = 0,
+    SYNC_AUDIO_MASTER,
+    SYNC_EXTER_CLOCK,
+}SyncMode;
 
 
 typedef struct PacketQueueStruct {
@@ -84,6 +100,7 @@ typedef struct PacketQueueStruct {
 } PktQueueStruct;
 
 typedef struct PacketQueueHead {
+    char name[32];
     struct list_head   *head;// *list_last;
     int                      max_len;
     int                      nb_packet;
@@ -96,6 +113,7 @@ typedef struct PacketQueueHead {
 } PktQueueHead;
 
 typedef struct FrameQueueHead {
+   char name[32];
    struct list_head   *head;
    int                max_len;
    int                nb_frame;
@@ -111,18 +129,37 @@ typedef struct FrameQueueStruct {
    struct list_head   frame_list;
 } FrameQueueStruct;
 
+typedef struct HwAudioPara {
+
+    enum AVSampleFormat  format;
+    uint64_t                       channel_layout;
+    int                               freq;
+    int                               channels;
+    int                               byte_per_sec;
+    int                               frame_size;
+
+}HwAudioPara;
+
 
 
 typedef struct VideoState {
-    AVFormatContext               *p_av_formatCtx;
+    AVFormatContext                *p_av_formatCtx;
     AVFrame                            *p_av_frame[MAX_STREAM_INDEX];
     AVCodec                            *p_av_codec[MAX_STREAM_INDEX];
-    AVCodecContext                *p_av_codecCtx[MAX_STREAM_INDEX];
+    AVCodecContext                 *p_av_codecCtx[MAX_STREAM_INDEX];
+    int                                    streams_index[MAX_STREAM_INDEX];
+	
     PktQueueHead                    pktQueue[MAX_STREAM_INDEX];
     PktQueueStruct                   vPkt_queue_struct[MAX_VIDEO_PACKET_QUEUE_LEN+1];  
+    PktQueueStruct                   aPkt_queue_struct[MAX_AUDIO_PACKET_QUEUE_LEN+1];
     FrameQueueHead                frameQueue[VIDEO_STREAM_INDEX+1];
-    FrameQueueStruct              vFrame_queue_struct[MAX_VIDEO_FRAME_QUEUE_LEN+1];
-    int                                       streams_index[MAX_STREAM_INDEX];
+    FrameQueueStruct               vFrame_queue_struct[MAX_VIDEO_FRAME_QUEUE_LEN+1];
+
+
+    HwAudioPara                       hw_audio_para;
+    struct SwrContext                *p_a_swrCtx;
+    unsigned char                      *audio_buffer;
+    int                                      audio_buffer_size;
 #ifdef SDL_VERSION_LIBSDL1P2_DEV
     SDL_Surface                        *surface_bottom, *surface_top;
     SDL_Overlay                        *layer1;
@@ -140,6 +177,7 @@ VideoState g_video_state;
 
 LIST_HEAD(video_frame_list);
 LIST_HEAD(video_packet_list);
+LIST_HEAD(audio_packet_list);
 
 static int dump_frame(AVCodecContext *p_v_codecCtx, AVFrame *frame, int dump_count);
 
@@ -157,24 +195,24 @@ void show_help_default(const char *opt, const char *arg)
 static int save_bmp_file(char *path, void *data, struct image bmp)
 {
 
-   #define BF_TYPE_INDEX                  0X00
-   #define BF_SIZE_INDEX                  0X02
+   #define BF_TYPE_INDEX                       0X00
+   #define BF_SIZE_INDEX                        0X02
    #define BF_RESERVER1_INDEX             0X06
    #define BF_RESERVER2_INDEX             0X08
-   #define BF_OFFBITS_INDEX               0X0A
-   #define BI_SIZE_INDEX                  0X0E
-   #define BI_WIDTH_INDEX                 0X12
-   #define BI_HEIGHT_INDEX                0X16
-   #define BI_PLANES_INDEX                0X1A
-   #define BI_BITCOUNT_INDEX              0x1C
-   #define BI_COMPRESSION_INDEX           0X1E
+   #define BF_OFFBITS_INDEX                  0X0A
+   #define BI_SIZE_INDEX                        0X0E
+   #define BI_WIDTH_INDEX                    0X12
+   #define BI_HEIGHT_INDEX                   0X16
+   #define BI_PLANES_INDEX                   0X1A
+   #define BI_BITCOUNT_INDEX              0X1C
+   #define BI_COMPRESSION_INDEX        0X1E
    #define BI_SIZE_IMAGE_INDEX            0X22
-   #define BI_XPPM_INDEX                  0X26  //x pels per meter
-   #define BI_YPPM_INDEX                  0X2A  //y pels per meter
-   #define BI_CLR_USED_INDEX              0X2E
-   #define BI_CLR_IMPORTANT               0X32
+   #define BI_XPPM_INDEX                      0X26  //x pels per meter
+   #define BI_YPPM_INDEX                      0X2A  //y pels per meter
+   #define BI_CLR_USED_INDEX               0X2E
+   #define BI_CLR_IMPORTANT                0X32
    
-   #define BMP_FILE_HEAD_SIZE      (14)
+   #define BMP_FILE_HEAD_SIZE        (14)
    #define BMP_INFO_HEAD_SIZE       (40)
  
    #define BMP_HEAD_SIZE                (BMP_FILE_HEAD_SIZE+BMP_INFO_HEAD_SIZE)
@@ -375,12 +413,12 @@ static void get_input_param_list(InputParams *param, int argc, char *argv[])
 
 //AVFrame *p_av_frame_copy;
 
-static void frameStruct_init(VideoState *video_states)
+static void frameStruct_init( FrameQueueStruct frame_queue_struct[], int len)
 {
     int i;
 
-    for (i=0; i< MAX_VIDEO_FRAME_QUEUE_LEN+1; i++) {
-        memset(&video_states->vFrame_queue_struct[i], 0, sizeof(FrameQueueStruct));
+    for (i=0; i< len; i++) {
+        memset(&frame_queue_struct[i], 0, sizeof(FrameQueueStruct));
     }
 }
 
@@ -447,14 +485,20 @@ static void frameQueueStruct_destroy(FrameQueueHead *queue_head, FrameQueueStruc
     fQueueStruct->is_use = 0;
     fQueueStruct->frame_list.prev = NULL;
     fQueueStruct->frame_list.next = NULL;
-
-    av_info_log("%s: queue current len is %d\n", __FUNCTION__, queue_head->nb_frame);
+#ifdef __DEBUG_QUEUE__
+    av_info_log("%s: %s queue current len is %d\n", __FUNCTION__, queue_head->name, queue_head->nb_frame);
+#endif
     SDL_UnlockMutex(queue_head->mutex);
 
 }
-static void frameQueue_init(FrameQueueHead *queue_head, struct list_head *head, int max_len)
+static void frameQueue_init(FrameQueueHead *queue_head, struct list_head *head, int max_len, char *name)
 {
     memset(queue_head, 0, sizeof(FrameQueueHead));
+
+    if (name && strlen(name) + 1 <= 32)
+       memcpy(queue_head->name, name, (strlen(name)+1));
+    else
+       av_err_log("frameQueue name too long or NULL!len=%d\n", strlen(name)+1);
 
     queue_head->nb_frame = 0;
     queue_head->max_len = max_len;
@@ -480,7 +524,9 @@ static int frameQueue_put(FrameQueueHead *queue_head, FrameQueueStruct *frameQue
        list_add(&(frameQueue_struct->frame_list), queue_head->head->prev);
        queue_head->nb_frame++;
        SDL_UnlockMutex(queue_head->mutex);
-       av_info_log("%s: queue current len is %d\n", __FUNCTION__, queue_head->nb_frame);
+ #ifdef __DEBUG_QUEUE__
+       av_info_log("%s: %s queue current len is %d\n", __FUNCTION__, queue_head->name, queue_head->nb_frame);
+ #endif
        return 0;
 
     } else {
@@ -536,7 +582,7 @@ static int pktQueueStruct_create(PktQueueHead *queue_head,
                                                         AVPacket *packet)
 {
     int i;
-    
+
     SDL_LockMutex(queue_head->mutex);
 
     for (i=0; i<queue_head->max_len+1; i++) {
@@ -547,17 +593,18 @@ static int pktQueueStruct_create(PktQueueHead *queue_head,
        }
     }
 
-    if (i >= queue_head->max_len+1) {
+    if (i >=queue_head->max_len+1) {
        av_err_log("no malloc packetQueueStruct!index=%d\n", i);
        SDL_UnlockMutex(queue_head->mutex);   
        return i;
     }
 
     memset(*dst_pktQueueStruct, 0, sizeof(PktQueueStruct));
-    
+
+    // if (av_dup_packet(&(*dst_pktQueueStruct)->packet) < 0) {
     if (av_copy_packet(&(*dst_pktQueueStruct)->packet, packet) < 0) {
        av_free_packet(&(*dst_pktQueueStruct)->packet);
-       av_err_log("%s: duplicate a packet fail!\n", __FUNCTION__);
+
        (*dst_pktQueueStruct)->is_use = 0;
        SDL_UnlockMutex(queue_head->mutex);   
        return -1;
@@ -565,7 +612,7 @@ static int pktQueueStruct_create(PktQueueHead *queue_head,
 
     (*dst_pktQueueStruct)->is_use = 1;
     SDL_UnlockMutex(queue_head->mutex);   
-    
+
     return i;
 }
 
@@ -582,8 +629,10 @@ static int pktQueueStruct_destroy(PktQueueHead *queue_head, PktQueueStruct *pkt_
     pkt_queue_struct->serial = 0;
     pkt_queue_struct->is_use = 0;
     queue_head->nb_packet--;
-    av_info_log("%s: queue current len is %d\n", __FUNCTION__, queue_head->nb_packet);
     SDL_UnlockMutex(queue_head->mutex);    
+#ifdef __DEBUG_QUEUE__
+    av_info_log("%s: %s queue current len is %d\n", __FUNCTION__, queue_head->name, queue_head->nb_packet);
+#endif
     
     return 0;
 }
@@ -649,18 +698,23 @@ static int packetQueue_flush(PktQueueHead *queue_head)
    return 0;
 }
 
-static void packetStruct_init(VideoState *video_states)
+static void packetStruct_init( PktQueueStruct  pkt_queue_struct[], int len)
 {
     int i;
 
-    for (i=0; i< MAX_VIDEO_PACKET_QUEUE_LEN+1; i++) {
-        memset(&video_states->vPkt_queue_struct[i], 0, sizeof(PktQueueStruct));
+    for (i=0; i< len; i++) {
+        memset(&pkt_queue_struct[i], 0, sizeof(PktQueueStruct));
     }
 }
 
-static int packetQueue_init(PktQueueHead *queue_head, struct list_head *head, int max_len)
+static int packetQueue_init(PktQueueHead *queue_head, struct list_head *head, int max_len, char *name)
 {
     memset(queue_head, 0 , sizeof(PktQueueHead));
+
+    if (name && strlen(name) + 1 <= 32)
+       memcpy(queue_head->name, name, (strlen(name)+1));
+    else
+       av_err_log("packetQueue name too long or NULL!len=%d\n", strlen(name)+1);
     
     queue_head->size = 0;
     queue_head->nb_packet = 0;
@@ -707,11 +761,12 @@ static int packetQueue_put(PktQueueHead *queue_head, PktQueueStruct *pkt_queue_s
       queue_head->nb_packet++;  
       queue_head->size += pkt_queue_struct->packet.size;
       pkt_queue_struct->serial = ++queue_head->serial;
-      av_info_log("%s: queue current len is %d\n", __FUNCTION__, queue_head->nb_packet);
-      
+#ifdef __DEBUG_QUEUE__
+      av_info_log("%s: %s queue current len is %d\n",__FUNCTION__, queue_head->name, queue_head->nb_packet);
+#endif     
       ret = 0;  
    } else {
-     av_err_log("%s, queue is full! max_len=%d, len=%d\n", __FUNCTION__, queue_head->max_len, queue_head->nb_packet);   
+      av_err_log("%s, queue is full! max_len=%d, len=%d\n", __FUNCTION__, queue_head->max_len, queue_head->nb_packet);   
       ret = -1;
    }
    
@@ -745,7 +800,266 @@ static int packetQueue_get(PktQueueHead *queue_head, PktQueueStruct **pkt_queue_
    return ret;
 }
 
+static int audio_decode_frame(VideoState *video_states) 
+{
+    AVFrame *p_a_frame;
+    AVCodecContext *p_a_codecCtx;
+    struct SwrContext  *p_a_swrCtx;
 
+    PktQueueHead *p_a_pktQueueHead;
+    PktQueueStruct *pkt_queue_struct;
+
+    HwAudioPara   *p_a_hwPara;
+
+    int got_frame = -1;
+    int ret;
+    int data_size;
+    int resampled_data_size;
+ 
+    p_a_frame = video_states->p_av_frame[AUDIO_STREAM_INDEX];
+    p_a_codecCtx = video_states->p_av_codecCtx[AUDIO_STREAM_INDEX];
+    p_a_pktQueueHead = &video_states->pktQueue[AUDIO_STREAM_INDEX];
+    p_a_hwPara = &video_states->hw_audio_para;
+    p_a_swrCtx = video_states->p_a_swrCtx;
+
+
+   while (1) {
+   	
+       if (p_a_frame) 
+          av_frame_unref(p_a_frame);
+
+       while (packetQueue_is_empty(p_a_pktQueueHead)) {
+           SDL_LockMutex(p_a_pktQueueHead->mutex);
+           SDL_CondWait(p_a_pktQueueHead->cond, p_a_pktQueueHead->mutex);
+           SDL_UnlockMutex(p_a_pktQueueHead->mutex);
+        }
+
+        if (packetQueue_get(p_a_pktQueueHead, &pkt_queue_struct) >= 0) {
+			
+	    if (p_a_codecCtx->codec->type == AVMEDIA_TYPE_AUDIO) {
+              ret = avcodec_decode_audio4(p_a_codecCtx, p_a_frame, &got_frame, &pkt_queue_struct->packet);
+		 if (ret < 0) {
+                 av_err_log("avcodec decode audio frame fail!\n");
+                 return -1;
+	       }
+              pktQueueStruct_destroy(p_a_pktQueueHead, pkt_queue_struct);
+              SDL_LockMutex(p_a_pktQueueHead->mutex);
+              SDL_CondSignal(p_a_pktQueueHead->cond);
+              SDL_UnlockMutex(p_a_pktQueueHead->mutex);
+	    }
+		
+        }
+
+	 if (!got_frame) {
+           av_err_log("audio decode a frame fail\!\n");
+	    continue;
+	 } else {
+           //av_info_log("audio decode a frame success!\n");
+        }
+
+        data_size = av_samples_get_buffer_size(NULL, 
+			                                       av_frame_get_channels(p_a_frame), 
+			                                       p_a_frame->nb_samples, 
+			                                       p_a_frame->format, 
+			                                       1);
+
+         if (p_a_hwPara->format != p_a_frame->format ||
+             p_a_hwPara->freq != p_a_frame->sample_rate ||
+             p_a_hwPara->channel_layout != p_a_frame->channel_layout ||
+             p_a_hwPara->channels != p_a_frame->channels ) {
+
+             if (p_a_swrCtx) 
+                swr_free(&p_a_swrCtx);
+			 
+             p_a_swrCtx = swr_alloc_set_opts(NULL, 
+			 	                                  p_a_hwPara->channel_layout, p_a_hwPara->format, p_a_hwPara->freq,
+			 	                                  p_a_frame->channel_layout, p_a_frame->format, p_a_frame->sample_rate,
+                                                             0, NULL);
+             if (!p_a_swrCtx ||swr_init(p_a_swrCtx) < 0) {
+                av_err_log(
+                           "Cannot create sample rate converter for conversion of %d Hz %s %d channels to %d Hz %s %d channels!\n",
+                            p_a_frame->sample_rate, av_get_sample_fmt_name(p_a_frame->format), av_frame_get_channels(p_a_frame),
+                            p_a_hwPara->freq, av_get_sample_fmt_name(p_a_hwPara->format), p_a_hwPara->channels);
+                break;
+             }
+
+
+         }     
+
+	   if (p_a_swrCtx) {
+             unsigned char **in_data = p_a_frame->extended_data;
+             unsigned char **out_data =&video_states->audio_buffer;
+	      int out_nb_samples = p_a_frame->nb_samples+256;
+             int out_size = av_samples_get_buffer_size(NULL, p_a_hwPara->channels, out_nb_samples,  p_a_hwPara->format, 0);
+             int len;
+			 
+             if (out_size < 0) {
+                av_err_log("av_samples_get_buffer_size() fail!\n");
+                break;
+             }
+			 
+             av_fast_malloc(&video_states->audio_buffer, &video_states->audio_buffer_size, out_size);
+             if (!video_states->audio_buffer) {
+                av_err_log("av_fast_malloc() alloc fail!\n");
+                return AVERROR(ENOMEM);
+             }
+			 
+             // swr_convert return samples count
+	      len = swr_convert(p_a_swrCtx, out_data, out_nb_samples, in_data, p_a_frame->nb_samples);
+
+             if (len < 0) {
+                av_err_log("swr_convert() fail!\n");
+                break;
+             }
+			 
+             if (len == out_nb_samples) {
+                av_err_log("audio buffer is probably too small!\n");
+                swr_init(p_a_swrCtx);
+             }
+
+             resampled_data_size = len * av_get_bytes_per_sample(p_a_hwPara->format) * p_a_hwPara->channels ;
+             
+          }
+
+
+	 //video_states->audio_buffer = p_a_frame->data[0];
+
+        return resampled_data_size;
+
+
+   }
+   av_info_log("audio_decode_frame exit!\n");
+   return 0;
+}
+
+
+static void audio_callback(void* userdata, unsigned char *stream, int len)
+{
+   int len1;
+   static unsigned int  audio_buf_index = 0, audio_buf_size = 0;
+   
+   VideoState *video_states;
+
+   video_states = (VideoState *)userdata;
+
+   //av_info_log("call %s!\n", __FUNCTION__);
+   
+    while (len > 0) {
+        if (audio_buf_index >= audio_buf_size) {
+           audio_buf_size = audio_decode_frame(video_states);
+	     if (audio_buf_size < 0) {
+              av_err_log("audio_decode_frame get buffer size is zero!\n");
+			  
+	     } else {
+             audio_buf_index = 0;
+			 
+	     }	
+         }
+         len1 = audio_buf_size - audio_buf_index;
+
+         len1 = (len1 > len) ? len: len1;
+
+         memcpy(stream, (unsigned char *)video_states->audio_buffer + audio_buf_index, len1);
+
+         stream += len1;
+         len -= len1;
+         audio_buf_index += len1;
+	  
+    }
+ 
+	
+	
+ //   audio_decode_frame(video_states);
+}
+
+static void dump_audio_para(VideoState *video_states)
+{
+    HwAudioPara   *p_a_hwPara;
+    p_a_hwPara = &video_states->hw_audio_para;
+	
+    av_err_log("dump audio hw parameter:   \n");
+    printf ("          audio channels: %d\n",               p_a_hwPara->channels);
+    printf ("          audio channels layout: 0x%x\n",   p_a_hwPara->channel_layout);
+    printf ("          audio format: %d\n",                   p_a_hwPara->format);
+    printf ("          audio freq: %dhz\n",                   p_a_hwPara->freq);
+    printf ("          audio frame size: %d bytes\n",     p_a_hwPara->frame_size);
+    printf ("          audio byte_per_sec: %d bytes\n", p_a_hwPara->byte_per_sec);
+
+}
+
+
+static int audio_open(VideoState *video_states, 
+	                              int64_t wanted_channel_layout, 
+	                              int wanted_channel_nb, 
+	                              int sample_rate, 
+	                              HwAudioPara *hw_audio_para)
+{
+    SDL_AudioSpec wanted_spec, actual_spec;
+    const char *env;
+	
+    env = SDL_getenv("SDL_AUDIO_CHANNELS");
+
+    //av_info_log("call %s!\n", __FUNCTION__);
+
+    if (env) {
+       wanted_channel_nb = atoi(env);
+       wanted_channel_layout = av_get_default_channel_layout(wanted_channel_nb);
+    }
+
+    if (!wanted_channel_layout ||wanted_channel_nb != av_get_channel_layout_nb_channels(wanted_channel_layout))	 {
+        //why do it?
+        wanted_channel_layout = av_get_default_channel_layout(wanted_channel_nb);
+	 wanted_channel_layout &= ~AV_CH_LAYOUT_STEREO_DOWNMIX;
+    }
+
+    wanted_channel_nb = av_get_channel_layout_nb_channels(wanted_channel_layout);
+
+    wanted_spec.channels = wanted_channel_nb;
+    wanted_spec.freq = sample_rate;
+    //signedl 16-bit samples in native byte order
+    wanted_spec.format = AUDIO_S16SYS;
+    wanted_spec.silence = 0;
+    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2<<ff_log2(wanted_spec.freq/SDL_AUDIO_MAX_CALLBACKS_PER_SEC));
+    wanted_spec.callback = audio_callback;
+    wanted_spec.userdata = video_states;
+
+    if (SDL_OpenAudio(&wanted_spec, &actual_spec) < 0) {
+       av_err_log("SDL_OpenAudio fail!\n");
+	 return -1;
+    }
+
+    if (actual_spec.channels != wanted_spec.channels) {
+       wanted_channel_layout = av_get_default_channel_layout(wanted_spec.channels);
+       if (!wanted_channel_layout) {
+          av_err_log("sdl channel count %d not support.\n", actual_spec.channels);
+          return -1;
+       }
+    }
+	
+    if (actual_spec.format != AUDIO_S16SYS) {
+       av_err_log("Could not support 'AUDIO_S16SYS' format!\n");
+	 return -1;
+    }
+
+    hw_audio_para->channels = actual_spec.channels;
+    hw_audio_para->channel_layout = wanted_channel_layout;
+    hw_audio_para->format = AV_SAMPLE_FMT_S16;
+    hw_audio_para->freq = actual_spec.freq;
+    hw_audio_para->frame_size = av_samples_get_buffer_size(NULL, hw_audio_para->channels, 
+		                                                       1, hw_audio_para->format, 1);
+    hw_audio_para->byte_per_sec = av_samples_get_buffer_size(NULL, hw_audio_para->channels, 
+		                                                        hw_audio_para->freq, hw_audio_para->format, 1);
+
+    //dump_audio_para(video_states);
+
+    if (hw_audio_para->frame_size <= 0) {
+        av_err_log("av_samples_get_buffer_size failed\n");
+        return -1;
+    }
+
+    return actual_spec.size;
+	
+}
 //the thread read packet from input file
 static int read_packet_thread(void *ptr)
 {
@@ -753,7 +1067,7 @@ static int read_packet_thread(void *ptr)
     AVFormatContext       *p_av_formatCtx;
     AVCodecContext        *p_v_codecCtx;
     PktQueueStruct         *pkt_queue_struct;
-    PktQueueHead          *p_v_pktQueueHead;
+    PktQueueHead          *p_v_pktQueueHead, *p_a_pktQueueHead;
     VideoState               *video_states;
 
     int ret;
@@ -761,40 +1075,56 @@ static int read_packet_thread(void *ptr)
     
     video_states = (VideoState *)ptr;
     p_av_formatCtx = video_states->p_av_formatCtx;
-    p_v_codecCtx = video_states->p_av_codecCtx[VIDEO_STREAM_INDEX];
+    //p_v_codecCtx = video_states->p_av_codecCtx[VIDEO_STREAM_INDEX];
     p_v_pktQueueHead = &video_states->pktQueue[VIDEO_STREAM_INDEX];
+    p_a_pktQueueHead = &video_states->pktQueue[AUDIO_STREAM_INDEX];
 
 
     while (1) {
        av_init_packet(&pkt);
+	   
        if (av_read_frame(p_av_formatCtx, &pkt) < 0) {
           av_err_log("av_read_frame fail!\n");
           break;
        }
 
-
+       pkt_queue_struct = NULL;
+	   
        if (pkt.stream_index == video_states->streams_index[VIDEO_STREAM_INDEX]) {
-           ret = pktQueueStruct_create(p_v_pktQueueHead, 
+          ret = pktQueueStruct_create(p_v_pktQueueHead, 
                                                            &pkt_queue_struct,
                                                            video_states->vPkt_queue_struct,  
                                                            &pkt);
         
-            while (packetQueue_is_full(p_v_pktQueueHead)) { 
-                 SDL_LockMutex(p_v_pktQueueHead->mutex);      
-                 SDL_CondWait(p_v_pktQueueHead->cond, p_v_pktQueueHead->mutex);
-                 SDL_UnlockMutex(p_v_pktQueueHead->mutex);
-            }    
-            packetQueue_put(p_v_pktQueueHead, pkt_queue_struct);
-            SDL_LockMutex(p_v_pktQueueHead->mutex); 
-            SDL_CondSignal(p_v_pktQueueHead->cond);
-            SDL_UnlockMutex(p_v_pktQueueHead->mutex);
+          while (packetQueue_is_full(p_v_pktQueueHead)) { 
+               SDL_LockMutex(p_v_pktQueueHead->mutex);      
+               SDL_CondWait(p_v_pktQueueHead->cond, p_v_pktQueueHead->mutex);
+               SDL_UnlockMutex(p_v_pktQueueHead->mutex);
+          }    
+          packetQueue_put(p_v_pktQueueHead, pkt_queue_struct);
+          SDL_LockMutex(p_v_pktQueueHead->mutex); 
+          SDL_CondSignal(p_v_pktQueueHead->cond);
+          SDL_UnlockMutex(p_v_pktQueueHead->mutex);
 
-        }
-
-       else if (pkt.stream_index == video_states->streams_index[AUDIO_STREAM_INDEX])  {
-
-        
        }
+       else if (pkt.stream_index == video_states->streams_index[AUDIO_STREAM_INDEX]) {
+            ret = pktQueueStruct_create(p_a_pktQueueHead, 
+                                                           &pkt_queue_struct,
+                                                           video_states->aPkt_queue_struct,  
+                                                           &pkt);
+            while (packetQueue_is_full(p_a_pktQueueHead)) { 
+                 SDL_LockMutex(p_a_pktQueueHead->mutex);      
+                 SDL_CondWait(p_a_pktQueueHead->cond, p_a_pktQueueHead->mutex);
+                 SDL_UnlockMutex(p_a_pktQueueHead->mutex);
+            }    
+            packetQueue_put(p_a_pktQueueHead, pkt_queue_struct);
+            SDL_LockMutex(p_a_pktQueueHead->mutex); 
+            SDL_CondSignal(p_a_pktQueueHead->cond);
+            SDL_UnlockMutex(p_a_pktQueueHead->mutex);
+
+
+       }
+
      
        else if (pkt.stream_index == video_states->streams_index[SUBTILE_STREAM_INDEX]) {
 
@@ -802,14 +1132,14 @@ static int read_packet_thread(void *ptr)
 
        av_free_packet(&pkt);
      
-    };
+    }
 
     return 0;
 }
 
 
 //the thread decode video packet
-static int decode_video_thread(void *ptr)
+static int video_decode_thread(void *ptr)
 {
 
     //AVFormatContext       *p_av_formatCtx;
@@ -874,7 +1204,7 @@ static int decode_video_thread(void *ptr)
 
     while(1) {
         
-        while(packetQueue_is_empty(p_v_pktQueueHead)) {
+        while (packetQueue_is_empty(p_v_pktQueueHead)) {
             SDL_LockMutex(p_v_pktQueueHead->mutex);
             SDL_CondWait(p_v_pktQueueHead->cond, p_v_pktQueueHead->mutex);
             SDL_UnlockMutex(p_v_pktQueueHead->mutex);
@@ -888,7 +1218,7 @@ static int decode_video_thread(void *ptr)
            SDL_UnlockMutex(p_v_pktQueueHead->mutex);
            
            if (got_frame) {
-              av_info_log("decode a frame success!\n");
+              //av_info_log("video decode a frame success!\n");
 
               ret = frameQueueStruct_create(p_v_frameQueueHead,
                                             &fQueueStruct, 
@@ -907,7 +1237,7 @@ static int decode_video_thread(void *ptr)
               SDL_UnlockMutex(p_v_frameQueueHead->mutex); 
 
            } else {
-              av_err_log("decode a frame fail!\n");
+              av_err_log("video decode a frame fail!\n");
               continue;
            }
 
@@ -1039,28 +1369,33 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
        return -1;
     }
 
-
+     // open codec
+     ret = avcodec_open2(p_av_codecCtx, p_av_codec,  NULL); 
+     if (ret < 0) {
+         av_err_log("open %s(id=%d) codec fail!\n", avcodec_get_name(codec_id), codec_id);
+         return -1;
+     }   
+			
     switch (codec_type) {
         case AVMEDIA_TYPE_VIDEO:
             video_states->p_av_codecCtx[VIDEO_STREAM_INDEX] = p_av_codecCtx;
             video_states->p_av_codec[VIDEO_STREAM_INDEX] = p_av_codec;
-            // open codec
-            ret = avcodec_open2(p_av_codecCtx, p_av_codec,  NULL); 
-            if (ret < 0) {
-                av_err_log("open %s(id=%d) codec fail!\n", avcodec_get_name(codec_id), codec_id);
-                return -1;
-            }   
+
             av_info_log("find video decoder sucess! name=\"%s\",id=%d\n", avcodec_get_name(codec_id), codec_id);
 
             packetQueue_init(&video_states->pktQueue[VIDEO_STREAM_INDEX], 
                                          &video_packet_list, 
-                                         MAX_VIDEO_PACKET_QUEUE_LEN);
-            packetStruct_init(video_states);
-           
+                                         MAX_VIDEO_PACKET_QUEUE_LEN,
+                                         "video_pkt");
+            packetStruct_init(video_states->vPkt_queue_struct, MAX_VIDEO_PACKET_QUEUE_LEN+1);
+
+		   
             frameQueue_init(&video_states->frameQueue[VIDEO_STREAM_INDEX], 
                                         &video_frame_list,
-                                        MAX_VIDEO_FRAME_QUEUE_LEN);
-            frameStruct_init(video_states);
+                                        MAX_VIDEO_FRAME_QUEUE_LEN,
+                                        "vidoe_frame");
+            frameStruct_init(video_states->vFrame_queue_struct, MAX_VIDEO_FRAME_QUEUE_LEN+1);
+
                 
             video_states->p_av_frame[VIDEO_STREAM_INDEX] = av_frame_alloc();
             if (!video_states->p_av_frame[VIDEO_STREAM_INDEX]) {
@@ -1070,7 +1405,7 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
 
 #ifdef SDL_VERSION_LIBSDL1P2_DEV
             video_states->read_pkt_tid = SDL_CreateThread(read_packet_thread, video_states);
-            video_states->decode_video_tid = SDL_CreateThread(decode_video_thread, video_states);
+            video_states->decode_video_tid = SDL_CreateThread(video_decode_thread, video_states);
 
             video_states->surface_top = SDL_SetVideoMode(p_av_codecCtx->width, p_av_codecCtx->height, 0, 0);
             if (!video_states->surface_top) {
@@ -1086,15 +1421,38 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
 
 #elif defined(SDL_VERSION_LIBSDL2P0_DEV)
            SDL_CreateThread(read_packet_thread, "read packet", video_states);
-           SDL_CreateThread(decode_video_thread, "video_decode", video_states);
+           SDL_CreateThread(video_decode_thread, "video_decode", video_states);
                 
 #endif
 
            break;
         
      case AVMEDIA_TYPE_AUDIO:
+
+          video_states->p_av_frame[AUDIO_STREAM_INDEX] = av_frame_alloc();
+          if (!video_states->p_av_frame[AUDIO_STREAM_INDEX]) {
+             av_err_log("alloc frame fail at %d\n", __LINE__);
+             return -1;
+          }
+		  
           video_states->p_av_codecCtx[AUDIO_STREAM_INDEX] = p_av_codecCtx;
           video_states->p_av_codec[AUDIO_STREAM_INDEX] = p_av_codec;
+          ret = audio_open(video_states, p_av_codecCtx->channel_layout, 
+                                 p_av_codecCtx->channels, p_av_codecCtx->sample_rate, 
+                                 &video_states->hw_audio_para);
+ 
+          if (ret < 0) {
+            av_err_log("audio_open fail!\n");
+	      return -1;
+          }
+
+	   packetQueue_init(&video_states->pktQueue[AUDIO_STREAM_INDEX], 
+	   	                       &audio_packet_list,
+	   	                       MAX_AUDIO_PACKET_QUEUE_LEN,
+	   	                       "audio_pkt");
+          packetStruct_init(video_states->aPkt_queue_struct, MAX_AUDIO_PACKET_QUEUE_LEN+1);
+
+          SDL_PauseAudio(0);
           break;
         
      case AVMEDIA_TYPE_SUBTITLE:
@@ -1138,7 +1496,7 @@ static int dump_YUV420P_frame(AVFrame *frame, int dump_count)
     
     p_buf = (unsigned char *)av_malloc(buffer_size * sizeof(unsigned char));
     if (!p_buf) {
-       av_err_log("av_malloc buffer fail at %d, buffer_size=%d.\n", __LINE__, (buffer_size * sizeof(unsigned char)));   
+       av_err_log("av_malloc buffer fail at %d, buffer_size=%ld.\n", __LINE__, (buffer_size * sizeof(unsigned char)));   
        av_frame_free(&p_v_frame);       
        return -1;
     }
@@ -1185,11 +1543,10 @@ static int videoImage_display(VideoState *video_states, AVFrame *frame)
     rect.y = 0;
     rect.w = frame->width;
     rect.h = frame->height;
-
-
-    SDL_DisplayYUVOverlay(video_states->layer1, &rect);
  
     SDL_UnlockYUVOverlay(video_states->layer1);
+
+    SDL_DisplayYUVOverlay(video_states->layer1, &rect);
     
     return 1;
 }
@@ -1315,6 +1672,7 @@ int main(int argc, char *argv[])
        return -1;
 
     stream_component_open(&g_video_state, AVMEDIA_TYPE_VIDEO);
+    stream_component_open(&g_video_state, AVMEDIA_TYPE_AUDIO);
 
     if (SDL_Init(SDL_INIT_VIDEO| SDL_INIT_AUDIO| SDL_INIT_TIMER)) {
        av_err_log("could not initializ SDL-%s\n", SDL_GetError());
