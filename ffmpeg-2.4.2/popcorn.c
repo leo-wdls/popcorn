@@ -367,7 +367,7 @@ static int get_video_frame(AVCodecContext *p_av_codecCtx, AVFrame *p_av_frame, i
 
 int scale_image(unsigned char *src_data, int src_lineSize[], 
                 int src_W, int src_H, enum AVPixelFormat src_format,
-                unsigned char *dst_data, int dst_lineSize[],
+                unsigned char *dst_data[], int dst_lineSize[],
                 int dst_W, int dst_H, enum AVPixelFormat dst_format,
                 int sws_flag)
 {
@@ -397,7 +397,6 @@ int scale_image(unsigned char *src_data, int src_lineSize[],
 
 static void init_player(VideoState *video_states)
 {
-    video_states->paused = 0;
     video_states->paused = 0;
     video_states->stop = 0;
     video_states->show_mode = SHOW_MODE_NONE;
@@ -431,7 +430,6 @@ static int frameQueueStruct_create(FrameQueueHead *queue_head,
     int i;
 
     FrameQueueStruct *p_dst_fQueueStruct;
-    AVPicture pict = {{0}};
 
     SDL_LockMutex(queue_head->mutex);
     
@@ -453,16 +451,9 @@ static int frameQueueStruct_create(FrameQueueHead *queue_head,
     
     p_dst_fQueueStruct = *dst_fQueueStruct;
     
-    pict.data[0] = p_dst_fQueueStruct->frame->data[0];
-    pict.data[1] = p_dst_fQueueStruct->frame->data[2];
-    pict.data[2] = p_dst_fQueueStruct->frame->data[1];
-    pict.linesize[0] = p_dst_fQueueStruct->frame->linesize[0];
-    pict.linesize[1] = p_dst_fQueueStruct->frame->linesize[2];
-    pict.linesize[2] = p_dst_fQueueStruct->frame->linesize[1];
-    
     scale_image(src_frame->data, src_frame->linesize, 
                          src_frame->width, src_frame->height, src_frame->format, 
-                         pict.data, pict.linesize,
+                         p_dst_fQueueStruct->frame->data, p_dst_fQueueStruct->frame->linesize,
                          src_frame->width, src_frame->height, AV_PIX_FMT_YUV420P,
                          SWS_BICUBIC);
 
@@ -1319,7 +1310,7 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
     enum AVCodecID     codec_id;
 
     int index, index_type;
-
+    int flags = SDL_HWSURFACE | SDL_ASYNCBLIT | SDL_HWACCEL | SDL_RESIZABLE;
     int ret;
 
     switch (stream_type) {
@@ -1407,7 +1398,7 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
             video_states->read_pkt_tid = SDL_CreateThread(read_packet_thread, video_states);
             video_states->decode_video_tid = SDL_CreateThread(video_decode_thread, video_states);
 
-            video_states->surface_top = SDL_SetVideoMode(p_av_codecCtx->width, p_av_codecCtx->height, 0, 0);
+            video_states->surface_top = SDL_SetVideoMode(p_av_codecCtx->width, p_av_codecCtx->height, 0, flags);
             if (!video_states->surface_top) {
                av_err_log("SDL SetVideoMode fail!\n");
                return -1;           
@@ -1511,7 +1502,7 @@ static int dump_YUV420P_frame(AVFrame *frame, int dump_count)
 
     p_v_frame->width = frame->width;
     p_v_frame->height = frame->height;
-    p_v_frame->format = AV_PIX_FMT_YUV420P;
+    p_v_frame->format = AV_PIX_FMT_RGB24;
 
     sprintf(path, "%s/%d.bmp", BMP_PATH, count);
     save_frame_to_bmp(path, p_v_frame->data[0], frame->width, frame->height, AV_PIX_FMT_RGB24);
@@ -1526,19 +1517,25 @@ static int dump_YUV420P_frame(AVFrame *frame, int dump_count)
 
 static int videoImage_display(VideoState *video_states, AVFrame *frame)
 {
-    //AVPicture picture;
+    AVPicture pict = {{0}};
     SDL_Rect rect;
 
     SDL_LockYUVOverlay(video_states->layer1);
     
-    video_states->layer1->pixels[0] = frame->data[0];
-    video_states->layer1->pixels[1] = frame->data[1];
-    video_states->layer1->pixels[2] = frame->data[2];
-
-    video_states->layer1->pitches[0] = frame->linesize[0];
-    video_states->layer1->pitches[1] = frame->linesize[1];
-    video_states->layer1->pitches[2] = frame->linesize[2];
-
+    pict.data[0] = video_states->layer1->pixels[0];
+    pict.data[1] = video_states->layer1->pixels[2];
+    pict.data[2] = video_states->layer1->pixels[1];
+    
+    pict.linesize[0] = video_states->layer1->pitches[0];
+    pict.linesize[1] = video_states->layer1->pitches[2];
+    pict.linesize[2] = video_states->layer1->pitches[1];
+    
+    scale_image(frame->data, frame->linesize, 
+                frame->width, frame->height, frame->format, 
+                pict.data, pict.linesize, 
+                frame->width, frame->height, AV_PIX_FMT_YUV420P,
+                SWS_BICUBIC);
+    
     rect.x = 0;
     rect.y = 0;
     rect.w = frame->width;
@@ -1653,7 +1650,8 @@ static void av_write_log(const char *fmt, ...)
 
 int main(int argc, char *argv[])
 {
-
+    int flag;
+    //char dummy_videodriver[] = "SDL_VIDEODRIVER=dummy"; 
 #if 0
     //log_sys_init(&g_video_state);
 
@@ -1674,7 +1672,9 @@ int main(int argc, char *argv[])
     stream_component_open(&g_video_state, AVMEDIA_TYPE_VIDEO);
     stream_component_open(&g_video_state, AVMEDIA_TYPE_AUDIO);
 
-    if (SDL_Init(SDL_INIT_VIDEO| SDL_INIT_AUDIO| SDL_INIT_TIMER)) {
+    //SDL_putenv("SDL_VIDEODRIVER=dummy");
+    flag = SDL_INIT_EVENTTHREAD | SDL_INIT_VIDEO| SDL_INIT_AUDIO| SDL_INIT_TIMER;
+    if (SDL_Init(flag)) {
        av_err_log("could not initializ SDL-%s\n", SDL_GetError());
      return -1;
     }
