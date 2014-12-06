@@ -1586,9 +1586,10 @@ static int refresh_loopWait_event(VideoState *video_states, SDL_Event *event)
 #endif
     {
         videoFrame_refresh(video_states);
+        SDL_PumpEvents();
     }
 
-    SDL_PumpEvents();
+
 
     return 0;
 }
@@ -1601,11 +1602,11 @@ static int event_loop(VideoState *video_states)
     while(1) {
        refresh_loopWait_event(video_states, &event);
        switch (event.type) {
-           case SDL_KEYDOWN:
-            switch (event.key.keysym.sym) {
-                   case SDLK_LEFT:
-                  exit(1);
-                  break;
+       case SDL_KEYDOWN:
+           switch (event.key.keysym.sym) {
+           case SDLK_q:
+               exit(1);
+               break;
                 
             }
        }
