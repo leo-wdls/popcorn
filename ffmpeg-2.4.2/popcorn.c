@@ -34,6 +34,8 @@
 #define MAX_AUDIO_PACKET_QUEUE_LEN          (5)
 #define MAX_QUEUE_SIZE                                  (15*1024*1024)
 
+#define MY_CREATE_OVERLAY_EVENT                (SDL_USEREVENT+1)
+
 static void av_write_log(const char *fmt, ...);
 
 #define __DEBUG_LOG__ 1
@@ -78,10 +80,15 @@ typedef enum SteamIndex {
     MAX_STREAM_INDEX,
 } streamIndex;
 
+/*
+  * ShowMode:
+  * SHOW_MODE_AUDIO: only have audio stream
+  * SHOW_MODE_VIDEO: have video steam, may not have audio stream
+  */
 typedef enum ShowMode {
     SHOW_MODE_NONE = 0X00,
-    SHOW_MODE_VIDEO = 0X01,
-    SHOW_MODE_AUDIO = 0X02,
+    SHOW_MODE_AUDIO = 0X01,
+    SHOW_MODE_VIDEO = 0X02,
     SHOW_MODE_NB = 0X01 |0X02,
 }ShowMode;
 
@@ -140,6 +147,12 @@ typedef struct HwAudioPara {
 
 }HwAudioPara;
 
+typedef struct Rect {
+    int x;
+    int y;
+    int width;
+    int height;
+}Rect;
 
 
 typedef struct VideoState {
@@ -160,6 +173,10 @@ typedef struct VideoState {
     struct SwrContext                *p_a_swrCtx;
     unsigned char                      *audio_buffer;
     int                                      audio_buffer_size;
+
+    Rect                         screen_size;
+    Rect                         cur_win_info;
+    Rect                         disp_area;
 #ifdef SDL_VERSION_LIBSDL1P2_DEV
     SDL_Surface                        *surface_bottom, *surface_top;
     SDL_Overlay                        *layer1;
@@ -346,7 +363,7 @@ static int parseFrame_from_packet(AVCodecParserContext *p_av_codecParserCtx, con
 
 }
 
-static int get_video_frame(AVCodecContext *p_av_codecCtx, AVFrame *p_av_frame, int *got_frame, const AVPacket *p_av_packet)
+static int get_videoFrame(AVCodecContext *p_av_codecCtx, AVFrame *p_av_frame, int *got_frame, const AVPacket *p_av_packet)
 {
    *got_frame = 0;
    
@@ -397,12 +414,17 @@ int scale_image(unsigned char *src_data, int src_lineSize[],
 
 static void init_player(VideoState *video_states)
 {
-    video_states->paused = 0;
-    video_states->stop = 0;
+    //video_states->paused = 0;
+    //video_states->stop = 0;
     video_states->show_mode = SHOW_MODE_NONE;
+	
+    video_states->cur_win_info.x = -1;
+    video_states->cur_win_info.y = -1;
+    video_states->cur_win_info.width = -1;
+    video_states->cur_win_info.height = -1;
 }
 
-static void get_input_param_list(InputParams *param, int argc, char *argv[])
+static void get_inputParam_list(InputParams *param, int argc, char *argv[])
 {
     param->argc = argc;
     param->cmd_name = argv[0];
@@ -791,7 +813,7 @@ static int packetQueue_get(PktQueueHead *queue_head, PktQueueStruct **pkt_queue_
    return ret;
 }
 
-static int audio_decode_frame(VideoState *video_states) 
+static int decode_audioFrame(VideoState *video_states) 
 {
     AVFrame *p_a_frame;
     AVCodecContext *p_a_codecCtx;
@@ -919,7 +941,7 @@ static int audio_decode_frame(VideoState *video_states)
 
 
    }
-   av_info_log("audio_decode_frame exit!\n");
+   av_info_log("decode_audioFrame exit!\n");
    return 0;
 }
 
@@ -937,9 +959,9 @@ static void audio_callback(void* userdata, unsigned char *stream, int len)
    
     while (len > 0) {
         if (audio_buf_index >= audio_buf_size) {
-           audio_buf_size = audio_decode_frame(video_states);
+           audio_buf_size = decode_audioFrame(video_states);
 	     if (audio_buf_size < 0) {
-              av_err_log("audio_decode_frame get buffer size is zero!\n");
+              av_err_log("decode_audioFrame get buffer size is zero!\n");
 			  
 	     } else {
              audio_buf_index = 0;
@@ -960,10 +982,10 @@ static void audio_callback(void* userdata, unsigned char *stream, int len)
  
 	
 	
- //   audio_decode_frame(video_states);
+ //   decode_audioFrame(video_states);
 }
 
-static void dump_audio_para(VideoState *video_states)
+static void dump_audioPara(VideoState *video_states)
 {
     HwAudioPara   *p_a_hwPara;
     p_a_hwPara = &video_states->hw_audio_para;
@@ -1041,7 +1063,7 @@ static int audio_open(VideoState *video_states,
     hw_audio_para->byte_per_sec = av_samples_get_buffer_size(NULL, hw_audio_para->channels, 
 		                                                        hw_audio_para->freq, hw_audio_para->format, 1);
 
-    //dump_audio_para(video_states);
+    //dump_audioPara(video_states);
 
     if (hw_audio_para->frame_size <= 0) {
         av_err_log("av_samples_get_buffer_size failed\n");
@@ -1202,7 +1224,7 @@ static int video_decode_thread(void *ptr)
         }
 
         if (packetQueue_get(p_v_pktQueueHead, &pkt_queue_struct) >= 0) {
-           get_video_frame(p_v_codecCtx, p_v_frame, &got_frame, (const AVPacket *)&pkt_queue_struct->packet);
+           get_videoFrame(p_v_codecCtx, p_v_frame, &got_frame, (const AVPacket *)&pkt_queue_struct->packet);
            pktQueueStruct_destroy(p_v_pktQueueHead, pkt_queue_struct);
            SDL_LockMutex(p_v_pktQueueHead->mutex);
            SDL_CondSignal(p_v_pktQueueHead->cond);           
@@ -1302,6 +1324,87 @@ static int stream_close(VideoState *video_states)
      return 0;
 }
 
+static void caculate_displayRect(Rect *area,
+	                                                 int win_w, int win_h, 
+	                                                 int pict_w, int pict_h, 
+	                                                 AVRational aspect_ratio) 
+{
+    int width, height;
+    float ratio;
+    if (aspect_ratio.num == 0) 
+	 ratio =0.0;
+    else
+        ratio = av_q2d(aspect_ratio);
+
+    if (ratio <= 0.0) {
+       ratio = 1.0;
+	//caculate aspect ratio
+       ratio *= (float)pict_w/(float)pict_h;
+    }
+
+    height = win_h;
+    width = ((int)rint(height*ratio)) & ~1;
+    height = ((int)rint(width/ratio)) & ~1;
+
+    if (width > win_w) {
+       width = win_w;
+       height = ((int)rint(width/ratio)) & ~1;  
+       width = ((int)rint(height*ratio)) & ~1;  
+    }
+
+    area->x = (win_w - width)/2;
+    area->y = (win_h - height)/2;    
+    area->width = FFMAX(width, 1);
+    area->height = FFMAX(height, 1);
+
+
+    //av_info_log("display area:w=%d, h=%d, x=%d, y=%d\n", area->width, area->height, area->x, area->y);
+    
+}
+
+
+static void set_default_winSize(const AVCodecContext *p_av_codecCtx, Rect *p_dispArea, Rect *p_cur_winInfo)
+{
+
+    AVRational aspect_ratio;
+	
+    aspect_ratio.num = 0;
+	
+
+    p_cur_winInfo->width = p_av_codecCtx->width;
+    p_cur_winInfo->height = p_av_codecCtx->height;
+
+    av_info_log("window size:w=%d, h=%d\n", p_cur_winInfo->width, p_cur_winInfo->height);	
+    caculate_displayRect(p_dispArea, 
+		               p_cur_winInfo->width, p_cur_winInfo->height, 
+		               p_av_codecCtx->width, p_av_codecCtx->height,
+		               aspect_ratio);
+
+}
+
+static int videoMode_open(VideoState *video_states, Rect *p_dispArea, Rect *p_cur_winInfo)
+{
+    AVRational aspect_ratio;
+    int flags = SDL_HWSURFACE | SDL_ASYNCBLIT | SDL_HWACCEL | SDL_RESIZABLE;
+
+    aspect_ratio.num = 0;
+	
+    
+    video_states->surface_top = SDL_SetVideoMode(p_cur_winInfo->width, p_cur_winInfo->height, 0, flags);
+    if (!video_states->surface_top) {
+       av_err_log("SDL SetVideoMode fail!\n");
+       return -1;           
+    }   
+
+    video_states->layer1 = SDL_CreateYUVOverlay(p_dispArea->width, p_dispArea->height, SDL_YV12_OVERLAY, video_states->surface_top);
+    if (!video_states->layer1) {
+       av_err_log("SDL CreateYUVOverlay fail!\n");
+       return -1;           
+    }
+
+    return 0;
+}
+
 static int stream_component_open(VideoState *video_states, enum AVMediaType stream_type)
 {
     AVCodecContext *p_av_codecCtx;
@@ -1310,7 +1413,6 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
     enum AVCodecID     codec_id;
 
     int index, index_type;
-    int flags = SDL_HWSURFACE | SDL_ASYNCBLIT | SDL_HWACCEL | SDL_RESIZABLE;
     int ret;
 
     switch (stream_type) {
@@ -1397,18 +1499,9 @@ static int stream_component_open(VideoState *video_states, enum AVMediaType stre
 #ifdef SDL_VERSION_LIBSDL1P2_DEV
             video_states->read_pkt_tid = SDL_CreateThread(read_packet_thread, video_states);
             video_states->decode_video_tid = SDL_CreateThread(video_decode_thread, video_states);
-
-            video_states->surface_top = SDL_SetVideoMode(p_av_codecCtx->width, p_av_codecCtx->height, 0, flags);
-            if (!video_states->surface_top) {
-               av_err_log("SDL SetVideoMode fail!\n");
-               return -1;           
-            }
-
-            video_states->layer1 = SDL_CreateYUVOverlay(p_av_codecCtx->width, p_av_codecCtx->height, SDL_YV12_OVERLAY, video_states->surface_top);
-            if (!video_states->layer1) {
-                av_err_log("SDL CreateYUVOverlay fail!\n");
-                return -1;           
-            }
+	     set_default_winSize(p_av_codecCtx, &video_states->disp_area, &video_states->cur_win_info);
+            if (videoMode_open(video_states, &video_states->disp_area, &video_states->cur_win_info) < 0) 
+		  return -1;
 
 #elif defined(SDL_VERSION_LIBSDL2P0_DEV)
            SDL_CreateThread(read_packet_thread, "read packet", video_states);
@@ -1515,46 +1608,49 @@ static int dump_YUV420P_frame(AVFrame *frame, int dump_count)
 }
 
 
-static int videoImage_display(VideoState *video_states, AVFrame *frame)
+
+static int videoImage_display(SDL_Overlay *layer, Rect *dispArea, AVFrame *frame)
 {
     AVPicture pict = {{0}};
     SDL_Rect rect;
 
-    SDL_LockYUVOverlay(video_states->layer1);
+    SDL_LockYUVOverlay(layer);
     
-    pict.data[0] = video_states->layer1->pixels[0];
-    pict.data[1] = video_states->layer1->pixels[2];
-    pict.data[2] = video_states->layer1->pixels[1];
-    
-    pict.linesize[0] = video_states->layer1->pitches[0];
-    pict.linesize[1] = video_states->layer1->pitches[2];
-    pict.linesize[2] = video_states->layer1->pitches[1];
-    
-    scale_image(frame->data, frame->linesize, 
-                frame->width, frame->height, frame->format, 
-                pict.data, pict.linesize, 
-                frame->width, frame->height, AV_PIX_FMT_YUV420P,
-                SWS_BICUBIC);
-    
-    rect.x = 0;
-    rect.y = 0;
-    rect.w = frame->width;
-    rect.h = frame->height;
- 
-    SDL_UnlockYUVOverlay(video_states->layer1);
 
-    SDL_DisplayYUVOverlay(video_states->layer1, &rect);
+    pict.data[0] = layer->pixels[0];
+    pict.data[1] = layer->pixels[2];
+    pict.data[2] = layer->pixels[1];
+    pict.linesize[0] = layer->pitches[0];
+    pict.linesize[1] = layer->pitches[2];
+    pict.linesize[2] = layer->pitches[1];
+
+    scale_image(frame->data, frame->linesize, 
+                         frame->width, frame->height, frame->format, 
+                         pict.data, pict.linesize,
+                         dispArea->width, dispArea->height, AV_PIX_FMT_YUV420P,
+                         SWS_BICUBIC);
+	
+    rect.x = dispArea->x;
+    rect.y = dispArea->y;
+    rect.w = dispArea->width;
+    rect.h = dispArea->height;
+ 
+    SDL_UnlockYUVOverlay(layer);
+
+    //dump_YUV420P_frame(frame, 20);
+    //av_info_log("pitch1=%d, pitch2=%d,pitch3=%d\n",  frame->linesize[0], frame->linesize[1],  frame->linesize[2]);
+    SDL_DisplayYUVOverlay(layer, &rect);
     
     return 1;
 }
 
-static int videoFrame_refresh(VideoState *video_states)
+static int videoFrame_refresh(VideoState *video_states, FrameQueueHead *p_v_fqueue_head)
 {
     AVFrame              *p_av_frame;
     FrameQueueStruct *frameQueue_struct;
-    FrameQueueHead  *p_v_fqueue_head;
 
-    p_v_fqueue_head = &video_states->frameQueue[VIDEO_STREAM_INDEX];    
+
+  
     while (frameQueue_is_empty(p_v_fqueue_head)) {
         SDL_LockMutex(p_v_fqueue_head->mutex);
         SDL_CondWait(p_v_fqueue_head->cond, p_v_fqueue_head->mutex);
@@ -1565,7 +1661,7 @@ static int videoFrame_refresh(VideoState *video_states)
     p_av_frame = frameQueue_struct->frame;
     //dump_YUV420P_frame(p_av_frame, 20);
     SDL_Delay(50);
-    videoImage_display(video_states, p_av_frame);
+    videoImage_display(video_states->layer1, &video_states->disp_area,  p_av_frame);
     frameQueueStruct_destroy(p_v_fqueue_head, frameQueue_struct);
     SDL_LockMutex(p_v_fqueue_head->mutex);
     SDL_CondSignal(p_v_fqueue_head->cond);
@@ -1574,6 +1670,25 @@ static int videoFrame_refresh(VideoState *video_states)
     return 0;
     
 }
+
+/*
+  * check showMode, and return showMode
+  */
+static int check_showMode(int streams_index[])
+{
+    int i;
+    int show_mode = SHOW_MODE_NONE;
+
+    for (i=0; i<SUBTILE_STREAM_INDEX; i++) {
+         if ((streams_index[i] != -1) &&(i == VIDEO_STREAM_INDEX))
+            show_mode = SHOW_MODE_VIDEO;
+         if ((streams_index[i] != -1) &&(i == AUDIO_STREAM_INDEX) && (show_mode != SHOW_MODE_VIDEO))
+            show_mode = SHOW_MODE_AUDIO;	  
+    }
+
+    return show_mode;
+}
+
 
 static int refresh_loopWait_event(VideoState *video_states, SDL_Event *event)
 {
@@ -1585,7 +1700,7 @@ static int refresh_loopWait_event(VideoState *video_states, SDL_Event *event)
     while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT))
 #endif
     {
-        videoFrame_refresh(video_states);
+        videoFrame_refresh(video_states, &video_states->frameQueue[VIDEO_STREAM_INDEX]);
         SDL_PumpEvents();
     }
 
@@ -1598,17 +1713,32 @@ static int refresh_loopWait_event(VideoState *video_states, SDL_Event *event)
 static int event_loop(VideoState *video_states)
 {
     SDL_Event event;
+    AVCodecContext *p_av_codecCtx;
+    AVRational aspect_ratio;
+    aspect_ratio.num = 0;  //temp
+
+    p_av_codecCtx = video_states->p_av_codecCtx[VIDEO_STREAM_INDEX];
 
     while(1) {
        refresh_loopWait_event(video_states, &event);
        switch (event.type) {
-       case SDL_KEYDOWN:
+           case SDL_KEYDOWN:
            switch (event.key.keysym.sym) {
-           case SDLK_q:
-               exit(1);
-               break;
+               case SDLK_q:
+                  exit(1);
+                  break;
                 
             }
+            case SDL_VIDEORESIZE:
+                video_states->cur_win_info.width = event.resize.w;
+                video_states->cur_win_info.height= event.resize.h;
+                caculate_displayRect(&video_states->disp_area,
+		                 video_states->cur_win_info.width, video_states->cur_win_info.height, 
+		                 p_av_codecCtx->width, p_av_codecCtx->height,
+		                 aspect_ratio);
+	     case MY_CREATE_OVERLAY_EVENT:
+		  videoMode_open(video_states, &video_states->disp_area, &video_states->cur_win_info);
+		  break;
        }
     }
 }
@@ -1652,7 +1782,7 @@ static void av_write_log(const char *fmt, ...)
 int main(int argc, char *argv[])
 {
     int flag;
-    //char dummy_videodriver[] = "SDL_VIDEODRIVER=dummy"; 
+    char dummy_videodriver[] = "SDL_VIDEODRIVER=dummy"; 
 #if 0
     //log_sys_init(&g_video_state);
 
@@ -1663,18 +1793,35 @@ int main(int argc, char *argv[])
     }
 
     g_video_state.mutex_log = SDL_CreateMutex();
-    init_player(&g_video_state);
 #endif  
-    get_input_param_list(&g_input_param, argc, argv);
+
+    init_player(&g_video_state);
+    get_inputParam_list(&g_input_param, argc, argv);
 
     if (stream_open(&g_video_state, g_input_param.input_file) < 0)
        return -1;
 
-    stream_component_open(&g_video_state, AVMEDIA_TYPE_VIDEO);
-    stream_component_open(&g_video_state, AVMEDIA_TYPE_AUDIO);
-
-    //SDL_putenv("SDL_VIDEODRIVER=dummy");
     flag = SDL_INIT_EVENTTHREAD | SDL_INIT_VIDEO| SDL_INIT_AUDIO| SDL_INIT_TIMER;
+	
+    g_video_state.show_mode = check_showMode(g_video_state.streams_index);
+	
+    //av_info_log("show mode is %x\n", g_video_state.show_mode);
+    
+    if (g_video_state.show_mode == SHOW_MODE_AUDIO) {
+       flag &= ~SDL_INIT_VIDEO;
+	   
+    } else if (g_video_state.show_mode == SHOW_MODE_VIDEO) {
+       stream_component_open(&g_video_state, AVMEDIA_TYPE_AUDIO);
+       stream_component_open(&g_video_state, AVMEDIA_TYPE_VIDEO);
+
+       const SDL_VideoInfo *vi = SDL_GetVideoInfo();
+       g_video_state.screen_size.x = -1;
+       g_video_state.screen_size.y = -1;
+       g_video_state.screen_size.width = vi->current_w;
+       g_video_state.screen_size.height = vi->current_h;
+    }
+
+    
     if (SDL_Init(flag)) {
        av_err_log("could not initializ SDL-%s\n", SDL_GetError());
      return -1;
